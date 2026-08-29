@@ -36,8 +36,8 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     ipv6=False,
-    max_concurrent_transmissions=10,
-    workers=8
+    max_concurrent_transmissions=4,
+    workers=4
 )
 
 ACTIVE_TASKS = {}
@@ -185,17 +185,17 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                 f'streamlink --http-header "User-Agent={ua}" '
                 f'--http-header "Referer={referer}" '
                 f'--retry-streams 10 --retry-open 10 --hls-live-restart '
-                f'--hls-duration {duration_str} '
                 f'--default-stream best "{stream_url}" best --stdout | '
-                f'ffmpeg -fflags +genpts -i pipe:0 -c:v copy -c:a aac -avoid_negative_ts make_zero -y "{output_file}"'
+                f'ffmpeg -fflags +genpts -i pipe:0 -t {total_sec} -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
             )
         else:
             return (
                 f'ffmpeg -hide_banner -nostats -loglevel error '
+                f'-protocol_whitelist "file,http,https,tcp,tls,crypto" '
                 f'-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
                 f'-headers "User-Agent: {ua}\r\nReferer: {referer}\r\n" '
                 f'-i "{stream_url}" -t {total_sec} '
-                f'-fflags +genpts -c:v copy -c:a aac -avoid_negative_ts make_zero -y "{output_file}"'
+                f'-fflags +genpts -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
             )
 
     try:
@@ -219,8 +219,6 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                 return
 
             elapsed = int(time.time() - start_t)
-            
-            # Auto-break when duration is achieved
             if elapsed >= total_sec:
                 try:
                     proc.terminate()
@@ -249,24 +247,27 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
             await asyncio.sleep(2)
 
         try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
+            await asyncio.wait_for(proc.wait(), timeout=6)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
             except Exception:
                 pass
 
+        # Flush wait to prevent MD5 checksum mismatch
+        await asyncio.sleep(1.5)
+
         if ACTIVE_TASKS.get(task_id, {}).get("cancelled"):
             safe_file_cleanup(output_file)
             return
 
         if not os.path.exists(output_file) or os.path.getsize(output_file) < 5000:
-            await status_msg.edit_text(f"❌ **Capture Failed!** Stream is offline or link expired.")
+            await status_msg.edit_text("❌ **Capture Failed!** Stream is offline or link expired.")
             safe_file_cleanup(output_file)
             return
 
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        await status_msg.edit_text("⚡ **Recording Complete! Preparing upload...**")
+        await status_msg.edit_text("⚡ **Recording Complete! Uploading to Telegram...**")
         start_up = time.time()
 
         caption = (
