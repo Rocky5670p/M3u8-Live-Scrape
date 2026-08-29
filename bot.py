@@ -107,9 +107,8 @@ def safe_file_cleanup(file_path):
     if file_path and os.path.exists(file_path):
         try:
             os.remove(file_path)
-            print(f"🧹 Cleaned: {file_path}")
-        except Exception as e:
-            print(f"⚠️ Delete error: {e}")
+        except Exception:
+            pass
 
 async def upload_progress(current, total, message, start_time, task_id):
     if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id].get("cancelled"):
@@ -160,9 +159,10 @@ def get_restricted_markup():
 async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="FFmpeg"):
     duration_str = format_seconds(total_sec)
     task_id = str(int(time.time()))
-    output_file = f"M3u8_Rec_{task_id}.mp4"
+    raw_file = f"raw_{task_id}.ts"
+    final_file = f"M3u8_Rec_{task_id}.mp4"
 
-    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": output_file}
+    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": final_file, "raw": raw_file}
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Stop & Cancel", callback_data=f"cancel|{task_id}")]])
     
     init_text = (
@@ -185,8 +185,7 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                 f'streamlink --http-header "User-Agent={ua}" '
                 f'--http-header "Referer={referer}" '
                 f'--retry-streams 10 --retry-open 10 --hls-live-restart '
-                f'--default-stream best "{stream_url}" best --stdout | '
-                f'ffmpeg -fflags +genpts -i pipe:0 -t {total_sec} -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
+                f'--default-stream best "{stream_url}" best -o "{raw_file}"'
             )
         else:
             return (
@@ -195,7 +194,7 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                 f'-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
                 f'-headers "User-Agent: {ua}\r\nReferer: {referer}\r\n" '
                 f'-i "{stream_url}" -t {total_sec} '
-                f'-fflags +genpts -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
+                f'-c copy -f mpegts -y "{raw_file}"'
             )
 
     try:
@@ -214,7 +213,8 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                     proc.kill()
                 except Exception:
                     pass
-                safe_file_cleanup(output_file)
+                safe_file_cleanup(raw_file)
+                safe_file_cleanup(final_file)
                 await status_msg.edit_text("🛑 **Recording Process Aborted by User.**")
                 return
 
@@ -247,26 +247,31 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
             await asyncio.sleep(2)
 
         try:
-            await asyncio.wait_for(proc.wait(), timeout=6)
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
 
-        # Flush wait to prevent MD5 checksum mismatch
-        await asyncio.sleep(1.5)
-
-        if ACTIVE_TASKS.get(task_id, {}).get("cancelled"):
-            safe_file_cleanup(output_file)
-            return
-
-        if not os.path.exists(output_file) or os.path.getsize(output_file) < 5000:
+        if not os.path.exists(raw_file) or os.path.getsize(raw_file) < 5000:
             await status_msg.edit_text("❌ **Capture Failed!** Stream is offline or link expired.")
-            safe_file_cleanup(output_file)
+            safe_file_cleanup(raw_file)
             return
 
-        file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+        await status_msg.edit_text("⚙️ **Finalizing video & generating streaming headers...**")
+
+        # Fast remux raw TS to perfect standard MP4
+        remux_cmd = f'ffmpeg -hide_banner -loglevel error -i "{raw_file}" -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{final_file}"'
+        remux_proc = await asyncio.create_subprocess_shell(remux_cmd)
+        await remux_proc.wait()
+        safe_file_cleanup(raw_file)
+
+        if not os.path.exists(final_file) or os.path.getsize(final_file) < 5000:
+            await status_msg.edit_text("❌ **Remux Error!** Failed to process final video.")
+            return
+
+        file_size_mb = os.path.getsize(final_file) / (1024 * 1024)
         await status_msg.edit_text("⚡ **Recording Complete! Uploading to Telegram...**")
         start_up = time.time()
 
@@ -283,7 +288,7 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
 
         await client.send_video(
             chat_id=chat_id,
-            video=output_file,
+            video=final_file,
             caption=caption,
             supports_streaming=True,
             progress=upload_progress,
@@ -296,7 +301,8 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
     except Exception as e:
         await status_msg.edit_text(f"⚠️ **Error Occurred:** `{str(e)}`")
     finally:
-        safe_file_cleanup(output_file)
+        safe_file_cleanup(raw_file)
+        safe_file_cleanup(final_file)
         if task_id in ACTIVE_TASKS:
             del ACTIVE_TASKS[task_id]
         if task_id in LAST_UPLOAD_UPDATE:
@@ -570,11 +576,13 @@ async def callback_router(client, query: CallbackQuery):
             ACTIVE_TASKS[task_id]["cancelled"] = True
             proc = ACTIVE_TASKS[task_id].get("proc")
             f_path = ACTIVE_TASKS[task_id].get("file")
+            r_path = ACTIVE_TASKS[task_id].get("raw")
             if proc:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+            safe_file_cleanup(r_path)
             safe_file_cleanup(f_path)
             await query.answer("🛑 Cancelled Successfully!", show_alert=True)
             try:
