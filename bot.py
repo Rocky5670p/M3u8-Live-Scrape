@@ -5,6 +5,8 @@ import asyncio
 import logging
 import psutil
 import pytz
+import json
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
@@ -18,15 +20,14 @@ class StopTransmission(Exception):
 
 API_ID = int(os.environ.get("API_ID", "29968148"))
 API_HASH = os.environ.get("API_HASH", "0dc95a4aa9b3514b9db31a4331bf630a")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8684051777:AAGpR1XxVtX39dUfC2wi9UukJXXdNZR1FZQ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8684051777:AAFKbrvMVgdo553t57E1y0skBL-Z0BF1ONo")
 PORT = int(os.environ.get("PORT", 8080))
 
 OWNER_ID = int(os.environ.get("OWNER_ID", "8788390728"))
 OWNER_USERNAME = "RAVEN_JI"
 
 DEFAULT_STREAM = "https://shoebinfo.qzz.io/bgmi/zee5.php/0-9-sarthaktv.m3u8"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-REFERER = "https://www.zee5.com/"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -50,6 +51,17 @@ def is_authorized(user_id):
 
 def get_user_engine(user_id):
     return USER_ENGINES.get(user_id, "FFmpeg")
+
+def get_dynamic_headers(stream_url):
+    parsed = urlparse(stream_url)
+    domain = f"{parsed.scheme}://{parsed.netloc}"
+    if "tarangplus.in" in stream_url:
+        referer = "https://www.tarangplus.in/"
+    elif "zee5.com" in stream_url or "sarthaktv" in stream_url:
+        referer = "https://www.zee5.com/"
+    else:
+        referer = f"{domain}/"
+    return USER_AGENT, referer
 
 def get_system_stats():
     cpu = psutil.cpu_percent(interval=None)
@@ -98,6 +110,42 @@ def safe_file_cleanup(file_path):
             print(f"🧹 Cleaned: {file_path}")
         except Exception as e:
             print(f"⚠️ Delete error: {e}")
+
+async def get_video_metadata(video_path):
+    """Extract width, height, and precise duration for Telegram player."""
+    width, height, duration = 1280, 720, 0
+    try:
+        probe_cmd = (
+            f'ffprobe -v error -show_entries stream=width,height,duration '
+            f'-of default=noprint_wrappers=1:nokey=1 "{video_path}"'
+        )
+        proc = await asyncio.create_subprocess_shell(
+            probe_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        lines = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
+        if len(lines) >= 2:
+            width = int(lines[0])
+            height = int(lines[1])
+        if len(lines) >= 3:
+            duration = int(float(lines[2]))
+    except Exception:
+        pass
+    return width, height, duration
+
+async def generate_thumbnail(video_path, thumb_path):
+    """Extract HD frame at second 3 for perfect video cover."""
+    try:
+        thumb_cmd = f'ffmpeg -hide_banner -loglevel error -ss 00:00:03 -i "{video_path}" -vframes 1 -q:v 2 -y "{thumb_path}"'
+        proc = await asyncio.create_subprocess_shell(thumb_cmd)
+        await proc.wait()
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 1000:
+            return thumb_path
+    except Exception:
+        pass
+    return None
 
 async def upload_progress(current, total, message, start_time, task_id):
     if task_id in ACTIVE_TASKS and ACTIVE_TASKS[task_id].get("cancelled"):
@@ -151,8 +199,9 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
     duration_str = format_seconds(total_sec)
     task_id = str(int(time.time()))
     output_file = f"M3u8_Rec_{task_id}.mp4"
+    thumb_file = f"thumb_{task_id}.jpg"
 
-    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": output_file}
+    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": output_file, "thumb": thumb_file}
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Stop & Cancel", callback_data=f"cancel|{task_id}")]])
     
@@ -168,23 +217,27 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
     )
     status_msg = await client.send_message(chat_id, init_text, reply_markup=markup)
 
+    ua, referer = get_dynamic_headers(stream_url)
+
     def generate_command():
         if engine == "Streamlink":
             return (
-                f'streamlink --http-header "User-Agent={USER_AGENT}" '
-                f'--http-header "Referer={REFERER}" '
+                f'streamlink --http-header "User-Agent={ua}" '
+                f'--http-header "Referer={referer}" '
                 f'--retry-streams 10 --retry-open 10 --hls-live-restart '
                 f'--hls-duration {duration_str} '
                 f'--default-stream best "{stream_url}" best --stdout | '
-                f'ffmpeg -fflags +genpts -i pipe:0 -c:v copy -c:a aac -avoid_negative_ts make_zero -y "{output_file}"'
+                f'ffmpeg -fflags +genpts -i pipe:0 -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
             )
         else:
             return (
                 f'ffmpeg -hide_banner -loglevel error '
+                f'-protocol_whitelist "file,http,https,tcp,tls,crypto" '
+                f'-rw_timeout 15000000 '
                 f'-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 '
-                f'-headers "User-Agent: {USER_AGENT}\r\nReferer: {REFERER}\r\n" '
+                f'-headers "User-Agent: {ua}\r\nReferer: {referer}\r\n" '
                 f'-i "{stream_url}" -t {total_sec} '
-                f'-fflags +genpts -c:v copy -c:a aac -avoid_negative_ts make_zero -y "{output_file}"'
+                f'-fflags +genpts -c:v copy -c:a aac -bsf:a aac_adtstoasc -movflags +faststart -y "{output_file}"'
             )
 
     try:
@@ -206,6 +259,7 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
                 except Exception:
                     pass
                 safe_file_cleanup(output_file)
+                safe_file_cleanup(thumb_file)
                 await status_msg.edit_text("🛑 **Recording Process Aborted by User.**")
                 return
 
@@ -260,15 +314,23 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
 
         if ACTIVE_TASKS.get(task_id, {}).get("cancelled"):
             safe_file_cleanup(output_file)
+            safe_file_cleanup(thumb_file)
             return
 
         if not os.path.exists(output_file) or os.path.getsize(output_file) < 5000:
             await status_msg.edit_text(f"❌ **Capture Failed!** Stream is offline or link expired in `{engine}` mode.")
             safe_file_cleanup(output_file)
+            safe_file_cleanup(thumb_file)
             return
 
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        await status_msg.edit_text("⚡ **Recording Complete! Preparing upload...**")
+        await status_msg.edit_text("⚡ **Generating video cover & preparing upload...**")
+
+        # Auto generate high quality thumbnail & meta
+        thumb_path = await generate_thumbnail(output_file, thumb_file)
+        width, height, probed_dur = await get_video_metadata(output_file)
+        final_dur = probed_dur if probed_dur > 0 else total_sec
+
         start_up = time.time()
 
         caption = (
@@ -286,6 +348,10 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
             chat_id=chat_id,
             video=output_file,
             caption=caption,
+            thumb=thumb_path,
+            duration=final_dur,
+            width=width,
+            height=height,
             supports_streaming=True,
             progress=upload_progress,
             progress_args=(status_msg, start_up, task_id)
@@ -298,6 +364,7 @@ async def execute_record_stream(client, chat_id, stream_url, total_sec, engine="
         await status_msg.edit_text(f"⚠️ **Error Occurred:** `{str(e)}`")
     finally:
         safe_file_cleanup(output_file)
+        safe_file_cleanup(thumb_file)
         if task_id in ACTIVE_TASKS:
             del ACTIVE_TASKS[task_id]
         if task_id in LAST_UPLOAD_UPDATE:
@@ -524,7 +591,7 @@ async def handle_time_input(client, message):
     end_time = target_time + timedelta(seconds=sched_data["duration_sec"])
 
     task_id = str(int(time.time()))
-    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": None}
+    ACTIVE_TASKS[task_id] = {"cancelled": False, "proc": None, "file": None, "thumb": None}
 
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Cancel Schedule", callback_data=f"cancel|{task_id}")]])
     
@@ -571,12 +638,14 @@ async def callback_router(client, query: CallbackQuery):
             ACTIVE_TASKS[task_id]["cancelled"] = True
             proc = ACTIVE_TASKS[task_id].get("proc")
             f_path = ACTIVE_TASKS[task_id].get("file")
+            t_path = ACTIVE_TASKS[task_id].get("thumb")
             if proc:
                 try:
                     proc.kill()
                 except Exception:
                     pass
             safe_file_cleanup(f_path)
+            safe_file_cleanup(t_path)
             await query.answer("🛑 Cancelled Successfully!", show_alert=True)
             try:
                 await query.message.edit_text("🛑 **Task or Schedule Cancelled by User.**")
