@@ -18,9 +18,9 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 class StopTransmission(Exception):
     pass
 
-API_ID = int(os.environ.get("API_ID", "29968148"))
-API_HASH = os.environ.get("API_HASH", "0dc95a4aa9b3514b9db31a4331bf630a")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8684051777:AAFKbrvMVgdo553t57E1y0skBL-Z0BF1ONo")
+API_ID = int(os.environ.get("API_ID", ""))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 8080))
 
 OWNER_ID = int(os.environ.get("OWNER_ID", "8788390728"))
