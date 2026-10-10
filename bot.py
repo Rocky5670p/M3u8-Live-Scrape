@@ -20,11 +20,11 @@ class StopTransmission(Exception):
 
 API_ID = int(os.environ.get("API_ID", ""))
 API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8555901681:AAE1Yt5NUnBP7ib7TbQ6gWkZsJN7LBzz7Vo")
 PORT = int(os.environ.get("PORT", 8080))
 
-OWNER_ID = int(os.environ.get("OWNER_ID", "8788390728"))
-OWNER_USERNAME = "RAVEN_JI"
+OWNER_ID = int(os.environ.get("OWNER_ID", "7456492367"))
+OWNER_USERNAME = "Todoroki Shoto"
 
 DEFAULT_STREAM = "https://shoebinfo.qzz.io/bgmi/zee5.php/0-9-sarthaktv.m3u8"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
